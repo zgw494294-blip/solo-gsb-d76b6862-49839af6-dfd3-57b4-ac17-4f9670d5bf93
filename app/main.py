@@ -473,12 +473,15 @@ def clip_scene(scene_id: str, req: ClipRequest) -> SceneResponse:
     - 源场景不存在：404；
     - from_ms >= to_ms、时间为布尔/字符串、target_scene_id 为空等
       非法请求：422（Pydantic 校验）；窗口内无相交字幕：422；
-    - expected_revision 过期、target_scene_id 已被占用（含与源同名）：409。
+    - expected_revision 过期或超前、target_scene_id 已被占用（含与源同名）：409。
 
-    源版本核对与目标创建在同一个 BEGIN IMMEDIATE 事务内完成：失败既不会
-    留下目标场景，也不会改动源场景或任何播放会话（播放会话本就是不被
-    场景读取所修改的内存快照）。目标创建后可直接用既有读取、修订与
-    播放接口操作。
+    版本核对分两道：读取源快照时先核对 record.revision ==
+    expected_revision——裁剪所用的 track_count、字幕与源分轨全部取自
+    这份快照，读取时版本不符立即 409，绝不拿错配快照裁剪；提交前在
+    BEGIN IMMEDIATE 事务内再核对一次，覆盖“读取匹配后、提交前源被
+    修订”的窗口。任一道失败既不会留下目标场景，也不会改动源场景或
+    任何播放会话（播放会话本就是不被场景读取所修改的内存快照）。
+    目标创建后可直接用既有读取、修订与播放接口操作。
     """
     _check_scene_id(scene_id)
 
@@ -486,6 +489,18 @@ def clip_scene(scene_id: str, req: ClipRequest) -> SceneResponse:
     if record is None:
         raise HTTPException(
             status_code=404, detail=f"场景 {scene_id!r} 不存在"
+        )
+    # 读取即核对：track_count、字幕与分轨都来自 record，它的版本必须与
+    # expected_revision 完全一致（过期或超前都算冲突）。current_revision
+    # 如实报告“本次读到的版本”，客户端可据此重新 GET 后重试。
+    if record.revision != req.expected_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "场景版本冲突：expected_revision 与当前版本不一致",
+                "scene_id": scene_id,
+                "current_revision": record.revision,
+            },
         )
 
     try:
