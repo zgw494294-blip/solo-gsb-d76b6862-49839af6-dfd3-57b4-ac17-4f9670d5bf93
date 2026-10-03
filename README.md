@@ -8,7 +8,7 @@
 - **并列裁决**：换轨次数相同时，取“按输入顺序排列的轨道号序列”字典序最小的方案。
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
-- 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；源版本核对与目标创建是同一事务，源场景过期返回 409、目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422。
+- 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；源完整快照读取、版本核对、片段构造与目标创建是同一个 `BEGIN IMMEDIATE` 事务——裁剪使用的 track_count、字幕与分轨必然取自与 `expected_revision` 一致的源快照，读取时版本不符或读取后源被并发修订都返回 409，目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422，任何失败都不创建目标、不改动源场景与播放会话。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。
 
 ## 一条命令启动
@@ -282,7 +282,7 @@ HTTP/1.1 409 Conflict
 
 ## 场景片段（clip）：把指定时段另存为从 0 毫秒起的独立片段
 
-已保存场景可以把其中的一个时段**另存为全新场景**：`POST /scenes/{scene_id}/clip`。片段的时间轴从 **0 毫秒**重新开始，并**保持源场景的画面轨道**——裁剪与创建是原子的，源场景与任何播放会话都不受影响。
+已保存场景可以把其中的一个时段**另存为全新场景**：`POST /scenes/{scene_id}/clip`。片段的时间轴从 **0 毫秒**重新开始，并**保持源场景的画面轨道**——源完整快照读取、版本核对、片段构造与目标创建是同一个原子事务，源场景与任何播放会话都不受影响。
 
 请求体字段：
 
@@ -296,14 +296,14 @@ HTTP/1.1 409 Conflict
 裁剪规则：
 
 - 保留与窗口 **`[from_ms, to_ms)`（左闭右开）相交**的字幕，按**源场景的字幕顺序**保留 `id`、`speaker`；时间裁到窗口内（`max(start, from)`、`min(end, to)`）再整体减去 `from_ms`，片段从 0 毫秒起。端点相接不算相交：`end_ms == from_ms` 或 `start_ms == to_ms` 的字幕被丢弃。
-- 源场景为每条字幕求出的轨道写入片段字幕的 **`locked_track`**，目标沿用源的 **`track_count`** 与既有最少换轨、并列规则重新求解——源分轨本身就是互不冲突的合法解，因此片段的 `assignments` 与源画面轨道**逐一相同**；`changes` 按裁剪后的片段重算。
+- 源场景为每条字幕求出的轨道写入片段字幕的 **`locked_track`**，目标沿用源的 **`track_count`** 与既有最少换轨、并列规则重新求解——源分轨本身就是互不冲突的合法解，因此片段的 `assignments` 与源画面轨道**逐一相同**；`changes` 按裁剪后的片段重算。裁剪所用的 `track_count`、字幕与分轨全部取自事务内与 `expected_revision` 核对一致的**同一次源快照读取**，不会混用其他版本的数据。
 - 片段保存为 **revision 1** 的独立场景，返回完整场景快照。之后可直接用既有 `GET/PUT /scenes/...` 与 `/sessions` 读取、修订、播放，**旧接口一律不变**。
 
 状态码：
 
 - **200**：裁剪成功，返回片段完整场景。
 - **404**：源场景不存在。
-- **409**：`expected_revision` 与源当前版本不一致（源被并发修订）；或 `target_scene_id` 已被占用。源版本核对与目标创建在**同一个 `BEGIN IMMEDIATE` 事务**内完成——失败既不会留下目标场景，也不会改动源场景。
+- **409**：`expected_revision` 与读取到的源版本不一致——包括请求到达时源已是其他版本，以及源快照读取匹配后、裁剪事务提交前源被并发抢先修订（裁剪在写锁内读取，抢先修订先生效则裁剪读到新版本）；或 `target_scene_id` 已被占用。源完整快照读取、版本核对、片段构造与目标创建在**同一个 `BEGIN IMMEDIATE` 事务**内完成——失败既不会留下目标场景，也不会改动源场景或任何播放会话。
 - **422**：`from_ms >= to_ms`、时间为负数/布尔值/字符串/浮点数、`target_scene_id` 为空等非法请求；或窗口内**没有任何相交字幕**。
 
 ### 示例 10：裁剪时段并另存（时间归零、保持原轨道）
@@ -435,7 +435,104 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/scenes/sc
 # 422
 ```
 
-### 示例 12：播放裁剪出来的片段（沿用既有会话接口）
+### 裁剪版本冲突的修复说明（源快照必须与 expected_revision 一致）
+
+此前片段另存分两步：先在事务外 `GET` 出源场景快照并据此构造片段（`track_count`、字幕、源分轨都来自这次读取），到 `BEGIN IMMEDIATE` 事务内才核对 `expected_revision`。于是存在快照与核对版本错配：请求带 `expected_revision: 2` 到达时源仍是版本 1，请求读出版本 1 的字幕与分轨；源随后被修订升级到版本 2，提交时 `2 == 2` 核对通过，**版本 1 的内容被当作“依据版本 2 的片段”成功保存**。
+
+修复后，源完整快照读取、版本核对、片段构造与目标创建在**同一个 `BEGIN IMMEDIATE` 事务**内完成：
+
+- 裁剪使用的 `track_count`、字幕与分轨全部取自与 `expected_revision` 一致的**同一次源快照读取**；
+- 读取时版本不符直接返回 **409**（不会用旧快照构造片段）；
+- 读取在保留写锁内进行、该锁持有到提交，因此读取匹配后到提交前源版本不可能变化；若源被并发抢先修订，裁剪事务读到的已是新版本，同样 **409**；
+- 任何失败都不创建目标、不改动源场景，也不影响任何播放会话。正常裁剪语义不变：按源顺序、时间归零、保持源画面轨道，片段保存为版本 1，仍可被读取、修订与播放。
+
+### 示例 12：片段版本冲突返回 409（可执行的交错演示）
+
+下面这段脚本先创建版本 1 的源，再升级到版本 2，然后分别演示“按旧版本裁剪”和“读取匹配后源被并发抢先修订”两种 409，以及“重新按当前版本裁剪成功”。可直接复制执行：
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 源场景版本 1：s1[0,1000)、s2[800,3000) 锁轨 2、s3[1000,2500)
+curl -s -X PUT $BASE/scenes/scene-conflict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+# 2) 源升级到版本 2：内容变为单条 only[0,50)
+curl -s -X PUT $BASE/scenes/scene-conflict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 1,
+    "subtitles": [
+      {"id": "only", "speaker": "Solo", "start_ms": 0, "end_ms": 50}
+    ]
+  }' >/dev/null
+
+# 3) 仍按旧版本 1 裁剪 -> 409（响应体给出 current_revision=2）；
+#    不会创建目标，也不会把版本 1 的三条字幕保存成片段
+curl -s -i -X POST $BASE/scenes/scene-conflict/clip \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-conflict-clip", "expected_revision": 1,
+       "from_ms": 0, "to_ms": 3000}'
+```
+
+```
+HTTP/1.1 409 Conflict
+```
+
+```json
+{"detail": {"message": "场景版本冲突：expected_revision 与当前版本不一致",
+            "scene_id": "scene-conflict", "current_revision": 2}}
+```
+
+失败不留痕：目标不存在，源仍为版本 2。
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' $BASE/scenes/scene-conflict-clip
+# 404
+curl -s $BASE/scenes/scene-conflict
+# ……"revision":2，"subtitles":[{"id":"only",……}]
+```
+
+“读取匹配后、提交前源被并发抢先修订”的情形结果相同：抢先的源修订先提交后，裁剪事务读到的源已是新版本，与请求携带的 `expected_revision` 不符，同样返回上面的 409（`current_revision` 为抢先提交后的版本），同样不创建目标、不改源。客户端按既有冲突处理方式即可：先 `GET /scenes/scene-conflict` 取当前版本与内容，确认窗口仍覆盖所需字幕，再带新的 `expected_revision` 重试。
+
+```bash
+# 4) 重新按当前版本 2 裁剪 -> 200：片段内容逐字段来自版本 2 快照，
+#    时间归零、保轨，保存为 revision=1 的独立新场景
+curl -s -X POST $BASE/scenes/scene-conflict/clip \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-conflict-clip", "expected_revision": 2,
+       "from_ms": 0, "to_ms": 3000}'
+```
+
+```json
+{
+  "scene_id": "scene-conflict-clip",
+  "revision": 1,
+  "track_count": 2,
+  "subtitles": [
+    {"id": "only", "speaker": "Solo", "start_ms": 0, "end_ms": 50, "locked_track": 1}
+  ],
+  "changes": 0,
+  "assignments": [
+    {"id": "only", "track": 1}
+  ],
+  "feasible": true
+}
+```
+
+片段是普通场景，随后可用 `GET/PUT /scenes/scene-conflict-clip` 读取或修订、用 `/sessions` 播放；源场景 `scene-conflict` 始终停留在版本 2，不受裁剪影响。
+
+### 示例 13：播放裁剪出来的片段（沿用既有会话接口）
 
 片段就是普通场景，用原来的 `/sessions` 接口播放即可。对示例 10 的 `scene-clip-1`（s1 `[0,100)`、s2 `[0,2100)`、s3 `[100,1600)`，轨道 1/2/1）创建会话并事件推进到 2100：
 
@@ -491,7 +588,7 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
   - 冲突或无解返回 **409** 且会话不变；成功则整体替换会话快照与 `source_revision`（**场景本身不变**），返回会话最新完整状态。
 - 会话不存在（含服务重启后）返回 404。
 
-### 示例 13：创建会话并推进游标
+### 示例 14：创建会话并推进游标
 
 沿用示例 6 创建的场景 `scene-001`（revision 1）：
 
@@ -541,7 +638,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 
 `active` 为游标时刻 `[start_ms, end_ms)` 内的字幕及轨道：900 时 s1（0≤900<1000）与 s2（800≤900<3000）在屏，s3（1000 才开始）不在。再次提交更小的 `time_ms` 返回 422。
 
-### 示例 14：事件推进一次跨过整条短字幕（进入与退出都不漏）
+### 示例 15：事件推进一次跨过整条短字幕（进入与退出都不漏）
 
 新建一个含短字幕的场景与会话：短字幕 `b` 只在 `[500, 600)` 出现，若播放客户端在 400 与 1000 两次采样，用 `/advance` 就完全看不到它；用 `/events` 则在跨过它的这次推进里成对拿到进入与退出。
 
@@ -615,7 +712,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/events \
 # {"session_id":"…","source_revision":1,"cursor_ms":1000,"events":[],"active":[]}
 ```
 
-### 示例 15：两个推进端点交接（共用游标，原 /advance 响应不变）
+### 示例 16：两个推进端点交接（共用游标，原 /advance 响应不变）
 
 `/advance` 与 `/events` 操作同一个会话游标，可以混用交接：客户端平时只需活动快照时用 `/advance`（响应仍是原有的 `source_revision`/`cursor_ms`/`active`，不含 `events`），需要补全跨过的进入/退出时用 `/events`。沿用示例 6 的 `scene-001`（s1 `[0,1000)`、s2 `[800,3000)` 锁轨 2、s3 `[1000,2500)`）：
 
@@ -670,7 +767,7 @@ curl -s -i -X POST http://localhost:8080/sessions/no-such-session/events \
 # HTTP/1.1 404 Not Found
 ```
 
-### 示例 16：接纳修订后再事件推进（事件与轨道来自接纳后的新快照）
+### 示例 17：接纳修订后再事件推进（事件与轨道来自接纳后的新快照）
 
 下面是一段可直接复制执行的完整脚本：创建 revision 1 → 建会话并推进到 900（s1、s2 已开始）→ 场景修订为 revision 2（s3 延长到 `[1000,4000)`，新增 s4 `[3200,4000)`）→ 会话接纳 → 用 `/events` 一次推进到 4000。
 
@@ -737,7 +834,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/events \
 
 事件与轨道全部来自**接纳后**的会话快照（s3 的 `end_ms` 已是 4000、s4 是修订新增的字幕、`source_revision` 为 2）；接纳失败（409）或尚未接纳的场景修订都不会影响事件——事件生成只读取轮到该请求生效时的会话快照，并与推进、接纳在会话锁内完整串行。4000 时刻 s3、s4 同为退出，按新快照的会话字幕顺序（s3 在 s4 前）排列。
 
-### 示例 17：播放中接纳场景修订
+### 示例 18：播放中接纳场景修订
 
 播放期间场景被修订（例如按示例 7 的方式把 `scene-001` 推进到 revision 2：s3 延长到 4000，并新增 s4 `[3200, 4000)`）。会话接纳最新快照：
 
@@ -765,7 +862,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/accept
 
 游标 900 时 s1、s2 已开始，保持原分轨 1、2 不变；s3、s4 在游标之后开始，按新快照重算分轨。`source_revision` 变为 2，场景本身的版本与内容不受接纳影响。
 
-### 示例 18：接纳冲突返回 409（会话不变）
+### 示例 19：接纳冲突返回 409（会话不变）
 
 若场景的修订动了已开始字幕（上例中游标 900 时修改了 s1 的起止时间、删除 s2、把轨道数改为 3，或新增的字幕在 900 之前开始等），接纳失败：
 
@@ -794,7 +891,7 @@ HTTP/1.1 409 Conflict
 
 修复后，接纳把“读取场景快照 → 校验已开始字幕 → 重算分轨 → 替换会话状态”作为**完整操作**在会话锁内串行生效：场景读取发生在轮到该请求生效之时，因此迟到的请求接纳的一定是当时的场景快照——既不会把旧数据回写到会话上，也不会跳过旧数据却报告成功。会话的 `source_revision` 对同一会话只增不回退。请求、响应与错误码（200/404/409/422）均与之前兼容。
 
-### 示例 19：并发接纳——迟到请求不会回写旧快照
+### 示例 20：并发接纳——迟到请求不会回写旧快照
 
 ```bash
 # 1) 创建场景（版本 1：未开始的 s3 end_ms=2000）
@@ -888,14 +985,14 @@ python tests/test_solver.py
 app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
-  storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段核对源版本与创建目标为同一事务）
+  storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段在同一事务内读取匹配版本完整快照、核对、构造并写入目标）
   playback.py  # 播放会话：单进程内存态，推进/事件推进/接纳串行化（接纳含场景读取的完整操作）与保轨重算
 tests/
   conftest.py        # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py     # 求解器单元测试
   test_api.py        # /assign HTTP 层测试
   test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
-  test_clips.py      # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性
+  test_clips.py      # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性、快照-版本一致的可控交错回归
   test_playback.py   # 播放会话创建/推进/接纳/冲突/并发测试
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data

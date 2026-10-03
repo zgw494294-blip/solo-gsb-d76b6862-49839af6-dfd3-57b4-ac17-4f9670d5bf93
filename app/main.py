@@ -17,6 +17,7 @@ from .playback import (
 )
 from .solver import Subtitle, solve, validate
 from .storage import (
+    ClipPayload,
     RevisionConflict,
     SceneRecord,
     SceneStore,
@@ -35,7 +36,7 @@ app = FastAPI(
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。事件推进接口返回"
         "一次推进跨过的全部字幕进入/退出事件，短字幕不会在两次采样之间漏掉。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -473,62 +474,47 @@ def clip_scene(scene_id: str, req: ClipRequest) -> SceneResponse:
     - 源场景不存在：404；
     - from_ms >= to_ms、时间为布尔/字符串、target_scene_id 为空等
       非法请求：422（Pydantic 校验）；窗口内无相交字幕：422；
-    - expected_revision 过期、target_scene_id 已被占用（含与源同名）：409。
+    - expected_revision 过期（含请求读到旧版本、提交前源被升级）、
+      target_scene_id 已被占用（含与源同名）：409。
 
-    源版本核对与目标创建在同一个 BEGIN IMMEDIATE 事务内完成：失败既不会
-    留下目标场景，也不会改动源场景或任何播放会话（播放会话本就是不被
-    场景读取所修改的内存快照）。目标创建后可直接用既有读取、修订与
-    播放接口操作。
+    源完整快照读取、版本核对、片段构造与目标创建在同一个
+    BEGIN IMMEDIATE 事务内完成：裁剪使用的 track_count、字幕与分轨
+    全部取自与 expected_revision 一致的同一次源快照读取，读取之后
+    直到提交源版本不可能变化。失败既不会留下目标场景，也不会改动
+    源场景或任何播放会话（播放会话本就是不被场景读取所修改的内存
+    快照）。目标创建后可直接用既有读取、修订与播放接口操作。
     """
     _check_scene_id(scene_id)
 
-    record = get_store().get_scene(scene_id)
-    if record is None:
-        raise HTTPException(
-            status_code=404, detail=f"场景 {scene_id!r} 不存在"
+    def build_payload(record: SceneRecord) -> ClipPayload:
+        subs, tracks, changes = _build_clip(record, req.from_ms, req.to_ms)
+        return ClipPayload(
+            track_count=record.track_count,
+            subtitles=[
+                {
+                    "id": s.id,
+                    "speaker": s.speaker,
+                    "start_ms": s.start_ms,
+                    "end_ms": s.end_ms,
+                    "locked_track": s.locked_track,
+                }
+                for s in subs
+            ],
+            assignments=[
+                {"id": s.id, "track": t} for s, t in zip(subs, tracks)
+            ],
+            changes=changes,
         )
-
-    try:
-        subs, tracks, changes = _build_clip(
-            record, req.from_ms, req.to_ms
-        )
-    except EmptyClip:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": "裁剪窗口 [from_ms, to_ms) 内没有与任何字幕相交的时段",
-                "scene_id": scene_id,
-                "from_ms": req.from_ms,
-                "to_ms": req.to_ms,
-            },
-        )
-
-    subtitles_data = [
-        {
-            "id": s.id,
-            "speaker": s.speaker,
-            "start_ms": s.start_ms,
-            "end_ms": s.end_ms,
-            "locked_track": s.locked_track,
-        }
-        for s in subs
-    ]
-    assignments_data = [
-        {"id": s.id, "track": t} for s, t in zip(subs, tracks)
-    ]
 
     try:
         target_record = get_store().commit_clip(
             source_scene_id=scene_id,
             target_scene_id=req.target_scene_id,
             expected_revision=req.expected_revision,
-            track_count=record.track_count,
-            subtitles=subtitles_data,
-            assignments=assignments_data,
-            changes=changes,
+            build_payload=build_payload,
         )
     except SourceSceneMissing:
-        # 源在读取后、事务内被删除（正常流程中场景不可删除）：按 404 处理
+        # 事务内读取发现源场景不存在（正常流程中场景不可删除，仅作防御）
         raise HTTPException(
             status_code=404, detail=f"场景 {scene_id!r} 不存在"
         )
@@ -550,6 +536,16 @@ def clip_scene(scene_id: str, req: ClipRequest) -> SceneResponse:
                 "current_revision": exc.current_revision,
             },
         )
+    except EmptyClip as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "裁剪窗口 [from_ms, to_ms) 内没有与任何字幕相交的时段",
+                "scene_id": scene_id,
+                "from_ms": req.from_ms,
+                "to_ms": req.to_ms,
+            },
+        ) from exc
 
     return _record_to_scene_response(target_record)
 

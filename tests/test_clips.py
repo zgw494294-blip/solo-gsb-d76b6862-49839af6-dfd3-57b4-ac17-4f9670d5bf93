@@ -2,7 +2,8 @@
 
 POST /scenes/{scene_id}/clip：把 [from_ms, to_ms) 另存为从 0 毫秒起、
 保持源画面轨道的 revision=1 新场景。覆盖裁剪语义、保轨、边界、
-404/409/422、原子性、源不变、既有接口可用等。
+404/409/422、原子性、源不变、既有接口可用，以及“读取的源快照必须与
+expected_revision 一致”的可控交错回归。
 """
 import threading
 
@@ -587,3 +588,291 @@ def test_clip_tracks_match_solver_with_locked_source_tracks():
     # 每条片段字幕的轨道都与源画面轨道相同
     for s in body["subtitles"]:
         assert s["locked_track"] == src_tracks[s["id"]]
+
+
+# ---------------------------------------------------------------------------
+# 可控交错回归：裁剪使用的源快照必须与 expected_revision 一致
+#
+# 旧实现先在事务外 get_scene 读出源快照并据此构造片段，到 commit_clip
+# 事务内才核对版本；于是 expected_revision=2 的请求在源仍为版本 1 时
+# 读出版本 1，源随后升级到版本 2，提交时 2==2 核对通过，版本 1 的字幕
+# 与分轨被当成“版本 2 的片段”保存——快照与核对版本错配。
+#
+# 修复后：源完整快照读取、版本核对、片段构造与目标写入在同一个
+# BEGIN IMMEDIATE 事务内完成。因此：
+# - 请求生效时版本不符 -> 读取即 409，绝不落库旧快照内容；
+# - 若在锁内读到匹配快照，则该锁持有到提交，源版本期间不可能变化，
+#   成功保存的片段必然逐字段来自该匹配快照（正常裁剪仍为版本 1）。
+# ---------------------------------------------------------------------------
+
+
+def revision2_subtitles():
+    """版本 2 的源：单条 only[0,50)，与版本 1 的三条字幕完全不同。"""
+    return [
+        {"id": "only", "speaker": "Solo", "start_ms": 0, "end_ms": 50}
+    ]
+
+
+def upgrade_source_to_revision2(client, scene_id):
+    return client.put(
+        f"/scenes/{scene_id}",
+        json={
+            "track_count": 2,
+            "expected_revision": 1,
+            "subtitles": revision2_subtitles(),
+        },
+    )
+
+
+def gate_clip_commit(monkeypatch):
+    """故障注入：受控暂停裁剪提交事务执行 BEGIN IMMEDIATE 之前的时机。
+
+    返回 (paused, release, arm)。arm() 之后，进程内第一个执行
+    BEGIN IMMEDIATE 的连接（即裁剪请求的提交事务）在真正获取写锁之前
+    被阻塞在 paused/release 上；暂停期间源修订仍可正常提交（此时裁剪
+    尚未持有写锁）。注入一次性生效，之后所有连接恢复直通。
+
+    这个切点恰好区分新旧实现：
+    - 旧实现：此前已在事务外用 get_scene 读源快照（无 BEGIN，不被拦），
+      片段也按该快照构造完成；暂停期间源升级后，事务内版本复核会把
+      旧快照当作匹配版本写入——快照与核对版本错配；
+    - 新实现：源快照读取就在这个 BEGIN IMMEDIATE 事务内，放行后读到的
+      一定是当时的源版本，片段内容与核对版本必然一致。
+    """
+    from app import storage as storage_module
+
+    paused = threading.Event()
+    release = threading.Event()
+    state = {"gated": False}
+
+    real_connect = storage_module.sqlite3.connect
+
+    class GatedConnection(storage_module.sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if (
+                not state["gated"]
+                and isinstance(sql, str)
+                and sql.strip().upper().startswith("BEGIN IMMEDIATE")
+            ):
+                state["gated"] = True
+                paused.set()
+                assert release.wait(timeout=10), "测试未能及时放行裁剪事务"
+            return super().execute(sql, parameters)
+
+    def fake_connect(db_path, *args, **kwargs):
+        kwargs.setdefault("factory", GatedConnection)
+        return real_connect(db_path, *args, **kwargs)
+
+    def arm():
+        monkeypatch.setattr(storage_module.sqlite3, "connect", fake_connect)
+
+    return paused, release, arm
+
+
+def post_clip_in_thread(scene_id, target, expected_revision, responses, key):
+    local = TestClient(app)
+    responses[key] = clip(
+        local, scene_id, target, expected_revision, 0, 3000
+    )
+
+
+def test_clip_expected_revision_2_reads_revision1_then_source_upgrades(
+    monkeypatch,
+):
+    """expected_revision=2 的裁剪在源为版本 1 时读到版本 1，随后源升级
+    到版本 2，裁剪事务才开始。放行后不得保存版本 1 的字幕与分轨。
+
+    修复后源读取与版本核对都在裁剪的 BEGIN IMMEDIATE 事务内：放行时
+    源已是版本 2，与 expected_revision 一致 -> 成功，且片段逐字段来自
+    版本 2 快照。旧实现先在事务外读出版本 1 并据此构造片段，提交时
+    2==2 复核通过，会成功保存版本 1 的三条字幕（本测试在旧代码下失败）。
+    """
+    client = TestClient(app)
+    make_source(client, "scene-mismatch")  # revision 1
+    paused, release, arm = gate_clip_commit(monkeypatch)
+
+    # 建一个源会话，验证失败/成功都不影响播放会话
+    sess = client.post(
+        "/sessions", json={"scene_id": "scene-mismatch"}
+    ).json()
+    client.post(
+        f"/sessions/{sess['session_id']}/advance", json={"time_ms": 900}
+    )
+
+    responses = {}
+    arm()
+    t = threading.Thread(
+        target=post_clip_in_thread,
+        args=("scene-mismatch", "scene-mismatch-out", 2, responses, "clip"),
+    )
+    t.start()
+    assert paused.wait(timeout=10), "裁剪事务未到达受控的 BEGIN 前切点"
+
+    # 裁剪挂起期间源从版本 1 升级到版本 2
+    rev = upgrade_source_to_revision2(client, "scene-mismatch")
+    assert rev.status_code == 200
+    assert rev.json()["revision"] == 2
+
+    release.set()
+    t.join(timeout=10)
+    assert not t.is_alive()
+
+    resp = responses["clip"]
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # 片段必须逐字段来自版本 2 快照，绝不能是挂起前读到的版本 1 三条
+    assert body["revision"] == 1
+    assert body["track_count"] == 2
+    assert [s["id"] for s in body["subtitles"]] == ["only"]
+    assert body["subtitles"] == [
+        {"id": "only", "speaker": "Solo",
+         "start_ms": 0, "end_ms": 50, "locked_track": 1}
+    ]
+    assert body["assignments"] == [{"id": "only", "track": 1}]
+    persisted = client.get("/scenes/scene-mismatch-out").json()
+    assert [s["id"] for s in persisted["subtitles"]] == ["only"]
+
+    # 源场景停留在版本 2，未被裁剪操作改动
+    src = client.get("/scenes/scene-mismatch").json()
+    assert src["revision"] == 2
+    assert [s["id"] for s in src["subtitles"]] == ["only"]
+
+    # 播放会话不受影响（仍为创建时的版本 1 快照、游标 900）
+    state = client.post(
+        f"/sessions/{sess['session_id']}/advance", json={"time_ms": 900}
+    ).json()
+    assert state["source_revision"] == 1
+    assert state["cursor_ms"] == 900
+    assert {(a["id"], a["track"]) for a in state["active"]} == {
+        ("s1", 1), ("s2", 2)
+    }
+
+
+def test_clip_read_matches_then_source_revised_before_commit_returns_409(
+    monkeypatch,
+):
+    """读取匹配 expected_revision 后、提交前源版本变化：必须 409，
+    且不创建目标、不改源、不改播放会话。
+
+    源修订先提交（版本 1 -> 2），裁剪事务随后才拿到写锁并读取：
+    修复后读取即在锁内、读到版本 2，与 expected_revision=1 不符 ->
+    读取时 409；旧实现的事务内复核同样返回 409。本测试锁定该语义并
+    验证失败零副作用。
+    """
+    client = TestClient(app)
+    make_source(client, "scope-rev2")  # revision 1
+    paused, release, arm = gate_clip_commit(monkeypatch)
+
+    sess = client.post(
+        "/sessions", json={"scene_id": "scope-rev2"}
+    ).json()
+
+    responses = {}
+    arm()
+    t = threading.Thread(
+        target=post_clip_in_thread,
+        args=("scope-rev2", "scope-rev2-out", 1, responses, "clip"),
+    )
+    t.start()
+    assert paused.wait(timeout=10), "裁剪事务未到达受控的 BEGIN 前切点"
+
+    # 裁剪持有写锁之前先把源升级到版本 2
+    rev = upgrade_source_to_revision2(client, "scope-rev2")
+    assert rev.status_code == 200
+
+    release.set()
+    t.join(timeout=10)
+    assert not t.is_alive()
+
+    resp = responses["clip"]
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["scene_id"] == "scope-rev2"
+    assert detail["current_revision"] == 2
+
+    # 失败零副作用：无目标、源停留在版本 2
+    assert client.get("/scenes/scope-rev2-out").status_code == 404
+    src = client.get("/scenes/scope-rev2").json()
+    assert src["revision"] == 2
+    assert [s["id"] for s in src["subtitles"]] == ["only"]
+
+    # 播放会话仍是版本 1 快照，不受失败裁剪与源修订影响
+    state = client.post(
+        f"/sessions/{sess['session_id']}/advance", json={"time_ms": 900}
+    ).json()
+    assert state["source_revision"] == 1
+    assert state["cursor_ms"] == 900
+    assert {(a["id"], a["track"]) for a in state["active"]} == {
+        ("s1", 1), ("s2", 2)
+    }
+
+
+def test_clip_normal_interleave_saves_matching_snapshot_as_revision1(
+    monkeypatch,
+):
+    """正常裁剪的可控交错：源读取期间源未变化，放行后成功保存——
+    片段时间归零、保持源画面轨道、保存为版本 1，目标可读取、修订、播放。
+    """
+    client = TestClient(app)
+    make_source(client, "scope-ok")  # revision 1
+    paused, release, arm = gate_clip_commit(monkeypatch)
+
+    responses = {}
+    arm()
+    t = threading.Thread(
+        target=post_clip_in_thread,
+        args=("scope-ok", "scope-ok-out", 1, responses, "clip"),
+    )
+    t.start()
+    assert paused.wait(timeout=10)
+    # 挂起期间源保持版本 1，不做任何修订
+    assert client.get("/scenes/scope-ok").json()["revision"] == 1
+    release.set()
+    t.join(timeout=10)
+    assert not t.is_alive()
+
+    resp = responses["clip"]
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scene_id"] == "scope-ok-out"
+    assert body["revision"] == 1
+    assert body["track_count"] == 2
+    # 窗口 [0,3000) 含全部三条，时间按源顺序、归零，分轨与源一致
+    assert [(s["id"], s["start_ms"], s["end_ms"], s["locked_track"])
+            for s in body["subtitles"]] == [
+        ("s1", 0, 1000, 1),
+        ("s2", 800, 3000, 2),
+        ("s3", 1000, 2500, 1),
+    ]
+    assert body["assignments"] == [
+        {"id": "s1", "track": 1},
+        {"id": "s2", "track": 2},
+        {"id": "s3", "track": 1},
+    ]
+
+    # 目标可读取、修订（revision 1 -> 2）、播放
+    got = client.get("/scenes/scope-ok-out").json()
+    assert got == body
+    rev = client.put(
+        "/scenes/scope-ok-out",
+        json={
+            "track_count": 2,
+            "expected_revision": 1,
+            "subtitles": revision2_subtitles(),
+        },
+    )
+    assert rev.status_code == 200
+    assert rev.json()["revision"] == 2
+    sess = client.post(
+        "/sessions", json={"scene_id": "scope-ok-out"}
+    ).json()
+    assert sess["source_revision"] == 2
+    adv = client.post(
+        f"/sessions/{sess['session_id']}/advance", json={"time_ms": 10}
+    ).json()
+    assert [a["id"] for a in adv["active"]] == ["only"]
+
+    # 源场景保持版本 1、内容不变
+    src = client.get("/scenes/scope-ok").json()
+    assert src["revision"] == 1
+    assert [s["id"] for s in src["subtitles"]] == ["s1", "s2", "s3"]
